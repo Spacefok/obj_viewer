@@ -12,9 +12,16 @@
 const int width = 800;
 const int height = 800;
 const int depth = 255;
+// Discard fragments whose normalized depth (z / depth) is greater than this threshold
+const float depth_clip_threshold = 0.015f;
 
 Model* model = nullptr;
 float* zbuffer = nullptr;
+// mask: 1 == fragment skipped due to depth clip
+unsigned char* clip_mask = nullptr;
+// diagnostics: range of interpolated normalized z before clipping
+float pre_minZ = std::numeric_limits<float>::infinity();
+float pre_maxZ = -std::numeric_limits<float>::infinity();
 
 Vec3f light_dir = Vec3f(1.f, -1.f, 1.f).normalize();
 
@@ -105,7 +112,9 @@ struct PhongShader : public IShader {
 
         Vec4f screen = uniform_VP * clip;
 
-        return Vec3f(screen.x, screen.y, screen.z);
+        // Use NDC z (clip.z in [-1,1]) mapped to [0,1]
+        float nz = (clip.z + 1.f) * 0.5f;
+        return Vec3f(screen.x, screen.y, nz);
     }
 
 
@@ -141,6 +150,7 @@ struct PhongShader : public IShader {
         float intensity = ambient + kd * diff + ks * spec;
         color = base * intensity;
         return false;
+
     }
 };
 
@@ -162,12 +172,24 @@ void triangle(Vec3f* pts, IShader& shader, TGAImage& image, float* zbuffer) {
             Vec3f bc = barycentric(pts, P);
             if (bc.x < 0.f || bc.y < 0.f || bc.z < 0.f) continue;
 
+            // pts[].z are already normalized in vertex() to [0,1]
             float z = pts[0].z * bc.x +
                 pts[1].z * bc.y +
                 pts[2].z * bc.z;
 
+            // diagnostics: record range of interpolated normalized z before clipping
+            pre_minZ = std::min(pre_minZ, z);
+            pre_maxZ = std::max(pre_maxZ, z);
+
             int idx = x + y * width;
-            if (zbuffer[idx] < z) {
+
+            // Clip by normalized depth [0,1]
+            if (z < depth_clip_threshold) {
+                if (clip_mask) clip_mask[idx] = 1;
+                continue;
+            }
+
+            if (zbuffer[idx] < -z) {
                 TGAColor color;
                 if (!shader.fragment(bc, color)) {
                     zbuffer[idx] = z;
@@ -187,8 +209,10 @@ int main(int argc, char** argv) {
     }
 
     zbuffer = new float[width * height];
+    clip_mask = new unsigned char[width * height];
     for (int i = 0; i < width * height; i++) {
         zbuffer[i] = -std::numeric_limits<float>::infinity();
+        clip_mask[i] = 0;
     }
 
     Camera camera(
@@ -219,19 +243,56 @@ int main(int argc, char** argv) {
     image.flip_vertically();
     image.write_tga_file("output.tga");
 
+    // compute z-buffer statistics and write grayscale zbuffer image
+    float minZ = std::numeric_limits<float>::infinity();
+    float maxZ = -std::numeric_limits<float>::infinity();
+    int validCount = 0;
+    for (int i = 0; i < width * height; ++i) {
+        float z = zbuffer[i];
+        if (z > -std::numeric_limits<float>::infinity() / 2) {
+            minZ = std::min(minZ, z);
+            maxZ = std::max(maxZ, z);
+            ++validCount;
+        }
+    }
+
+    std::cout << "Z-buffer valid pixels: " << validCount << std::endl;
+    if (validCount > 0) {
+        std::cout << "minZ = " << minZ << ", maxZ = " << maxZ << std::endl;
+        std::cout << "depth_clip_threshold (normalized) = " << depth_clip_threshold << std::endl;
+        std::cout << "equivalent absolute threshold = " << (depth_clip_threshold * static_cast<float>(depth)) << std::endl;
+        std::cout << "pre-clip normalized z range: " << pre_minZ << " .. " << pre_maxZ << std::endl;
+    } else {
+        std::cout << "No pixels written to z-buffer." << std::endl;
+    }
+
     TGAImage zbimage(width, height, TGAImage::GRAYSCALE);
     for (int x = 0; x < width; x++) {
         for (int y = 0; y < height; y++) {
             float z = zbuffer[x + y * width];
-            float zn = std::max(-1.f, std::min(1.f, z / depth));
-            unsigned char v = static_cast<unsigned char>((zn * 0.5f + 0.5f) * 255.f);
+            float zn = std::max(0.f, std::min(1.f, z));
+            unsigned char v = static_cast<unsigned char>(zn * 255.f);
             zbimage.set(x, y, TGAColor(v));
         }
     }
     zbimage.flip_vertically();
     zbimage.write_tga_file("zbuffer.tga");
 
+    TGAImage clipimg(width, height, TGAImage::GRAYSCALE);
+    int clippedPixels = 0;
+    for (int x = 0; x < width; x++) {
+        for (int y = 0; y < height; y++) {
+            unsigned char m = clip_mask[x + y * width];
+            if (m) ++clippedPixels;
+            clipimg.set(x, y, TGAColor(m ? 255 : 0));
+        }
+    }
+    clipimg.flip_vertically();
+    clipimg.write_tga_file("clip_mask.tga");
+    std::cout << "Clipped pixels (by depth threshold): " << clippedPixels << std::endl;
+
     delete model;
     delete[] zbuffer;
+    delete[] clip_mask;
     return 0;
 }
